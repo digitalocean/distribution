@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	events "github.com/docker/go-events"
@@ -96,6 +97,9 @@ type App struct {
 
 	// readOnly is true if the registry is in a read-only maintenance mode
 	readOnly bool
+
+	// inFlightRequestCount keeps track of current request count handled by the server
+	inFlightRequestCount atomic.Int64
 }
 
 // NewApp takes a configuration and returns a configured app, ready to serve
@@ -397,6 +401,17 @@ func (app *App) RegisterHealthChecks(healthRegistries ...*health.Registry) {
 		}
 	}
 
+	// Register in flight request with health checker
+	inFlightHttpRequestsCheck := func() error {
+		fmt.Printf("Doing in flight check: %v\n", app.inFlightRequestCount.Load())
+		if app.inFlightRequestCount.Load() > 1e4 {
+			return fmt.Errorf("In Flight HTTP Requests count check failed: %v", app.inFlightRequestCount.Load())
+		}
+		return nil
+	}
+
+	healthRegistry.RegisterFunc("inflighthttprequests", inFlightHttpRequestsCheck)
+
 	for _, fileChecker := range app.Config.Health.FileCheckers {
 		interval := fileChecker.Interval
 		if interval == 0 {
@@ -446,6 +461,17 @@ func (app *App) RegisterHealthChecks(healthRegistries ...*health.Registry) {
 	}
 }
 
+// This updates the inFlightRequestCount atomic counter
+// for each handler
+func (app *App) inFlightHTTPRequestCountHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		app.inFlightRequestCount.Add(1)
+		defer app.inFlightRequestCount.Add(-1)
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // register a handler with the application, by route name. The handler will be
 // passed through the application filters and context will be constructed at
 // request time.
@@ -459,6 +485,9 @@ func (app *App) register(routeName string, dispatch dispatchFunc) {
 		metrics.Register(namespace)
 		handler = metrics.InstrumentHandler(httpMetrics, handler)
 	}
+
+	// chain the handler with in flight HTTP requests updater
+	handler = app.inFlightHTTPRequestCountHandler(handler)
 
 	// TODO(stevvooe): This odd dispatcher/route registration is by-product of
 	// some limitations in the gorilla/mux router. We are using it to keep
